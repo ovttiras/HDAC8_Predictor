@@ -11,7 +11,7 @@ from streamlit_ketcher import st_ketcher
 import joblib
 import pickle
 from PIL import Image
-from rdkit import Chem, DataStructs
+from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import Draw
 from rdkit.Chem import AllChem, Descriptors
 from rdkit.ML.Descriptors import MoleculeDescriptors
@@ -94,6 +94,43 @@ def rdkit_numpy_convert(f_vs):
         DataStructs.ConvertToNumpyArray(f, arr)
         output.append(arr)
         return np.asarray(output)
+
+def try_parse_smiles_from_ketcher(s):
+    """
+    Try several ways to parse SMILES from Ketcher (export can break kekulization).
+    Returns an RDKit Mol or None.
+    """
+    if not s or not str(s).strip():
+        return None
+    s = str(s).strip()
+    # 1) Default parse
+    try:
+        mol = Chem.MolFromSmiles(s)
+        if mol is not None:
+            return mol
+    except Exception:
+        pass
+    # 2) No sanitize first, then full sanitize
+    try:
+        mol = Chem.MolFromSmiles(s, sanitize=False)
+        if mol is not None:
+            Chem.SanitizeMol(mol)
+            return mol
+    except Exception:
+        pass
+    # 3) Sanitize without kekulize, then set aromaticity
+    try:
+        mol = Chem.MolFromSmiles(s, sanitize=False)
+        if mol is not None:
+            Chem.SanitizeMol(
+                mol,
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE,
+            )
+            Chem.SetAromaticity(mol)
+            return mol
+    except Exception:
+        pass
+    return None
 
 # Расчет молекулярных дескрипторов
 #Расчет для HDAC8 активности 
@@ -348,7 +385,7 @@ def muegge(smiles):
 
     df = pd.DataFrame({
     'group': ['A','B'],
-    'MW/40': [10, mw_normalized],
+    'MW-200/40': [10, mw_normalized],
     'LogP/0.5': [10, logp_normalized],
     'HBD*2': [10, hbd_normalized],
     'HBA': [10, hba_normalized],
@@ -409,20 +446,48 @@ if files_option1 == 'Draw the molecule and click the "Apply" button':
     st.write('If you want to create a new chemical structure, press the "Reset" button')
     st.write(f'The SMILES of the created  chemical: "{smiles}"')
     if len(smiles)!=0:
+        # Suppress RDKit terminal messages during parse (e.g. Can't kekulize)
+        lg = RDLogger.logger()
+        lg.setLevel(RDLogger.CRITICAL)
         try:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                st.error("RDKit can't process your molecule. You might have an error in the chemical structure.")
-            else:
-                canon_smi = Chem.MolToSmiles(mol, isomericSmiles=False)
+            mol = try_parse_smiles_from_ketcher(smiles)
+        finally:
+            lg.setLevel(RDLogger.WARNING)
+
+        if mol is None:
+            st.warning(
+                "**Ketcher export could not be read by RDKit.** "
+                "The SMILES string from the editor sometimes fails aromatic bond assignment (kekulization), "
+                "so the structure cannot be used for the next steps."
+            )
+            st.info(
+                "**What to do:** In the menu above, select **SMILES** and paste the same structure as a SMILES string "
+                "(often the same compound parses correctly when entered as text). "
+                "You can copy the Ketcher string below."
+            )
+            st.code(smiles, language=None)
+        else:
+            try:
+                # Same as 'SMILES' input: InChI before standardization, then molvs
+                inchi = str(Chem.MolToInchi(mol))
+                canon_smi = Chem.MolToSmiles(mol, isomericSmiles=True)
                 smiles = standardize_smiles(canon_smi)
                 m = Chem.MolFromSmiles(smiles)
                 if m is None:
-                    st.error("RDKit can't process your molecule. You might have an error in the chemical structure.")
+                    st.warning(
+                        "**Standardization failed after Ketcher import.** "
+                        "Please use the **SMILES** input method and paste your structure there."
+                    )
+                    st.code(Chem.MolToSmiles(mol, isomericSmiles=True), language=None)
                 else:
-                    inchi = str(Chem.MolToInchi(m))
-        except Exception as e:
-            st.error("RDKit can't process your molecule. You might have an error in the chemical structure.")
+                    im = Draw.MolToImage(m)
+                    st.image(im)
+            except Exception:
+                st.warning(
+                    "**Could not finalize the structure from Ketcher.** "
+                    "Please enter the same compound using the **SMILES** input method."
+                )
+                st.code(smiles, language=None)
         
 if files_option1 == 'SMILES':
     SMILES_input = ""
@@ -433,13 +498,15 @@ if files_option1 == 'SMILES':
             if mol is None:
                 st.error("RDKit can't process your molecule. You might have an error in the chemical structure.")
             else:
-                canon_smi = Chem.MolToSmiles(mol, isomericSmiles=False)
+                # Создаем InChI напрямую из молекулы (с сохранением стереохимии)
+                inchi = str(Chem.MolToInchi(mol))
+                # Стандартизируем для дальнейшего использования
+                canon_smi = Chem.MolToSmiles(mol, isomericSmiles=True)
                 smiles = standardize_smiles(canon_smi)
                 m = Chem.MolFromSmiles(smiles)
                 if m is None:
                     st.error("RDKit can't process your molecule. You might have an error in the chemical structure.")
                 else:
-                    inchi = str(Chem.MolToInchi(m))
                     im = Draw.MolToImage(m)
                     st.image(im)
         except Exception as e:
@@ -457,7 +524,7 @@ if files_option1 == '*CSV file containing SMILES':
         for i in df_ws.SMILES: 
             index+=1           
             try:
-                canon_smi = Chem.MolToSmiles(Chem.MolFromSmiles(i),isomericSmiles = False)
+                canon_smi = Chem.MolToSmiles(Chem.MolFromSmiles(i),isomericSmiles = True)
                 df_ws.SMILES = df_ws.SMILES.replace (i, canon_smi)             
             except:
                 failed_mols.append(i)
@@ -487,9 +554,9 @@ if files_option1 == '*CSV file containing SMILES':
                 try:
                     mol_raw = Chem.MolFromSmiles(record, sanitize=False)
                     Chem.SanitizeMol(mol_raw)
-                    canon_smi = Chem.MolToSmiles(mol_raw, isomericSmiles=False)
-                    standard_record = standardize_smiles(canon_smi)
-                    m = Chem.MolFromSmiles(standard_record, sanitize=True)
+                    # Сохраняем canonical молекулу с изомерной информацией (как в CSV базе данных)
+                    canon_smi = Chem.MolToSmiles(mol_raw, isomericSmiles=True)
+                    m = Chem.MolFromSmiles(canon_smi, sanitize=True)
                     moldf.append(m)
                 except Exception as e:
                     failed_mols.append(record)
@@ -554,9 +621,9 @@ if files_option1 == 'MDL multiple SD file (*.sdf)':
             try:
                 mol_raw = Chem.MolFromSmiles(record, sanitize=False)
                 Chem.SanitizeMol(mol_raw)
-                canon_smi = Chem.MolToSmiles(mol_raw, isomericSmiles=False)
-                standard_record = standardize_smiles(canon_smi)
-                m = Chem.MolFromSmiles(standard_record, sanitize=True)
+                # Сохраняем canonical молекулу с изомерной информацией (как в CSV базе данных)
+                canon_smi = Chem.MolToSmiles(mol_raw, isomericSmiles=True)
+                m = Chem.MolFromSmiles(canon_smi, sanitize=True)
                 moldf.append(m)
             except Exception as e:
                 failed_mols.append(record)
