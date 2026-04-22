@@ -12,4 +12,4 @@ streamlit==1.41.1
 python-math==0.0.1
 ./streamlit_ketcher-0.0.1-py2.py3-none-any.whl
 altair>=5.4.0,<6
-catboost==1.2.6
+catboost==1.2.10
